@@ -1,57 +1,121 @@
 name: Build and Push Docker Image (Daily)
-
 on:
   schedule:
     - cron: "0 0 * * *"  # Daily at midnight (UTC)
-  workflow_dispatch:  # Allows manual triggering of the workflow
+  workflow_dispatch:
     inputs:
       trigger-build:
-        description: 'Trigger a manual build and push'
-        default: 'true'
+        description: "Trigger a manual build and push"
+        default: "true"
+      force-build:
+        description: "Force build even if no changes detected"
+        default: "false"
+        type: boolean
 
 jobs:
   build_and_push_multiarch:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120  # Job will timeout after 42 minutes
-
+    timeout-minutes: 120
     steps:
-      # Step 1: Check out the repository code
-      - name: Checkout code
-        uses: actions/checkout@v3
+      # Checkout with fetch-depth for comparison
+      - name: Checkout code from target branch
+        uses: actions/checkout@v4
+        with:
+          ref: 'refs/heads/main'
+          fetch-depth: 2  # Fetch last 2 commits for comparison
 
-      # Step 2: Set up Node.js version 18
+      # Check for changes since last build
+      - name: Check for changes
+        id: check_changes
+        run: |
+          # Check if there were changes in the last 24 hours
+          LAST_COMMIT_TIME=$(git log -1 --format=%ct)
+          CURRENT_TIME=$(date +%s)
+          TIME_DIFF=$((CURRENT_TIME - LAST_COMMIT_TIME))
+          HOURS_SINCE_COMMIT=$((TIME_DIFF / 3600))
+          
+          if [ $HOURS_SINCE_COMMIT -lt 24 ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "✅ Changes detected in last 24 hours"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "⏭️ No changes in last 24 hours"
+          fi
+
+      # Skip build if no changes (unless forced or manual trigger)
+      - name: Decide whether to build
+        id: should_build
+        run: |
+          if [ "${{ steps.check_changes.outputs.changed }}" == "true" ] || \
+             [ "${{ github.event_name }}" == "workflow_dispatch" ] || \
+             [ "${{ inputs.force-build }}" == "true" ]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "🚀 Proceeding with build"
+          else
+            echo "build=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Skipping build - no changes detected"
+          fi
+
+      # Set up Node.js version 20
       - name: Use Node.js version 20
+        if: steps.should_build.outputs.build == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # Step 3: Log in to Docker Hub using secrets
+      # Docker Hub login
       - name: Log in to Docker Hub
-        uses: docker/login-action@v2
+        if: steps.should_build.outputs.build == 'true'
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-
-      # Step 4: Create and use a new builder with multi-platform support
+      # Buildx
       - name: Set up Docker Buildx (Multi-Arch Builder)
+        if: steps.should_build.outputs.build == 'true'
         uses: docker/setup-buildx-action@v3
         with:
           driver-opts: image=moby/buildkit:master
           platforms: linux/amd64,linux/arm64,linux/arm/v6,linux/arm/v7
 
-      # Step 5: Set up QEMU (for multi-platform emulation)
+      # QEMU
       - name: Set up QEMU
+        if: steps.should_build.outputs.build == 'true'
         uses: docker/setup-qemu-action@v3
         with:
           platforms: linux/amd64,linux/arm64,linux/arm/v6,linux/arm/v7
-        
-      # Step 6: Build and Push Docker Image with multi-platform support (No cache)
+
+      # Build & Push with HYBRID cache
       - name: Build and Push Docker Image (Multi-Arch)
-        uses: docker/build-push-action@v4
+        if: steps.should_build.outputs.build == 'true'
+        uses: docker/build-push-action@v6
         with:
-          context: .  # Path to Dockerfile in repository
-          push: true  # Push image after build
-          tags: noxcis/unbound-dnscrypt:latest  # Tag for all platforms
-          platforms: linux/amd64,linux/arm64,linux/arm/v6,linux/arm/v7  # Platforms to build for
-          no-cache: true  # Disable caching to force a fresh build
+          context: .
+          push: true
+          tags: |
+            noxcis/unbound-dnscrypt:latest
+            noxcis/unbound-dnscrypt:${{ github.sha }}
+          platforms: linux/amd64,linux/arm64,linux/arm/v6,linux/arm/v7
+          # -------- Hybrid Cache Setup --------
+          # 1. Pull from GHA cache (fast) and fallback to registry cache
+          cache-from: |
+            type=gha
+            type=registry,ref=noxcis/unbound-dnscrypt:latest
+          # 2. Update both caches
+          cache-to: |
+            type=gha,mode=max
+            type=inline
+
+      # Summary
+      - name: Job Summary
+        if: always()
+        run: |
+          if [ "${{ steps.should_build.outputs.build }}" == "true" ]; then
+            echo "✅ Build completed successfully" >> $GITHUB_STEP_SUMMARY
+            echo "- Image: noxcis/unbound-dnscrypt:latest" >> $GITHUB_STEP_SUMMARY
+            echo "- Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⏭️ Build skipped - no changes in last 24 hours" >> $GITHUB_STEP_SUMMARY
+            echo "- Use 'force-build' option to override" >> $GITHUB_STEP_SUMMARY
+          fi
