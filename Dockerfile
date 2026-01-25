@@ -170,10 +170,62 @@ COPY --from=root-hints /root.hints .
 RUN { /opt/usr/sbin/unbound-anchor -v -r root.hints -a root.key || true ; } | tee -a /dev/stderr | grep -q "success: the anchor is ok"
 
 ####################################################################################################
+# Go Builder - Build Go from source with latest version enforcement
+####################################################################################################
+
+FROM --platform=$BUILDPLATFORM alpine:3.22.2@sha256:4b7ce07002c69e8f3d704a9c5d6fd3053be500b7f1c69fc0d80990c2ad8dd412 AS go-builder
+
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+ARG GO_VERSION
+
+# Install build dependencies and download Go with version enforcement
+RUN apk add --no-cache wget curl ca-certificates && \
+    set -eux; \
+    # Determine architecture for Go download
+    case "${BUILDPLATFORM}" in \
+        "linux/amd64") GO_ARCH="amd64" ;; \
+        "linux/arm64") GO_ARCH="arm64" ;; \
+        "linux/arm/v6" | "linux/arm/v7") GO_ARCH="armv6l" ;; \
+        *) echo "unsupported build platform: ${BUILDPLATFORM}" && exit 1 ;; \
+    esac; \
+    # Fetch latest Go version to determine minimum
+    echo "Fetching latest Go version to determine minimum..."; \
+    GO_VERSION_LATEST=$(curl -s "https://go.dev/VERSION?m=text" | head -n1 | sed 's/go//' | tr -d '\n\r'); \
+    if [ -z "${GO_VERSION_LATEST}" ]; then \
+        echo "ERROR: Failed to fetch latest Go version"; \
+        exit 1; \
+    fi; \
+    GO_VERSION_MIN="${GO_VERSION_LATEST}"; \
+    echo "Latest Go version (used as minimum): ${GO_VERSION_MIN}"; \
+    # Use latest if GO_VERSION not specified, otherwise validate
+    if [ -z "${GO_VERSION:-}" ]; then \
+        GO_VERSION="${GO_VERSION_MIN}"; \
+        echo "Using latest Go version: ${GO_VERSION}"; \
+    else \
+        echo "Using specified Go version: ${GO_VERSION}"; \
+        if [ "$(printf '%s\n' "${GO_VERSION_MIN}" "${GO_VERSION}" | sort -V | head -n1)" != "${GO_VERSION_MIN}" ]; then \
+            echo "ERROR: Specified Go version ${GO_VERSION} is older than minimum required ${GO_VERSION_MIN}"; \
+            exit 1; \
+        fi; \
+    fi; \
+    # Download and install Go
+    echo "Downloading Go ${GO_VERSION} for ${GO_ARCH}"; \
+    wget -q "https://golang.org/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"; \
+    tar -C /usr/local -xzf "go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"; \
+    rm "go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"; \
+    # Verify installation
+    /usr/local/go/bin/go version
+
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH="/go"
+ENV GOCACHE="/go/cache"
+
+####################################################################################################
 # DNSCrypt Proxy build
 ####################################################################################################
 
-FROM --platform=$BUILDPLATFORM golang:1.25.3-alpine3.21@sha256:0c9f3e09a50a6c11714dbc37a6134fd0c474690030ed07d23a61755afd3a812f AS dnscrypt-build
+FROM go-builder AS dnscrypt-build
 
 WORKDIR /src
 
@@ -194,7 +246,7 @@ RUN go get -u ./... && \
     go mod tidy && \
     go mod vendor
 
-RUN --mount=type=cache,target=/home/nonroot/.cache/go-build,uid=65532,gid=65532 \
+RUN --mount=type=cache,target=/go/cache \
     --mount=type=cache,target=/go/pkg \
 	CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} go build -v -ldflags="-s -w" -mod vendor
 
@@ -223,7 +275,7 @@ COPY --from=dnscrypt-build /config/example-dnscrypt-proxy.toml /dnscrypt-proxy.t
 # DNS Probe build
 ####################################################################################################
 
-FROM --platform=$BUILDPLATFORM golang:1.25.3-alpine3.21@sha256:0c9f3e09a50a6c11714dbc37a6134fd0c474690030ed07d23a61755afd3a812f AS probe
+FROM go-builder AS probe
 
 WORKDIR /src/dnsprobe
 
@@ -231,13 +283,19 @@ ARG TARGETOS TARGETARCH TARGETVARIANT
 
 COPY dnsprobe/ ./
 
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} go build -o /usr/local/bin/dnsprobe .
+# Update Go modules to latest compatible versions for security patches
+RUN go get -u ./... && \
+    go mod tidy
+
+RUN --mount=type=cache,target=/go/cache \
+    --mount=type=cache,target=/go/pkg \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} go build -ldflags="-s -w" -o /usr/local/bin/dnsprobe .
 
 ####################################################################################################
 # Launcher build (starts both dnscrypt-proxy and unbound)
 ####################################################################################################
 
-FROM --platform=$BUILDPLATFORM golang:1.25.3-alpine3.21@sha256:0c9f3e09a50a6c11714dbc37a6134fd0c474690030ed07d23a61755afd3a812f AS launcher
+FROM go-builder AS launcher
 
 WORKDIR /src/launcher
 
@@ -245,13 +303,19 @@ ARG TARGETOS TARGETARCH TARGETVARIANT
 
 COPY launcher/ ./
 
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} go build -o /usr/local/bin/launcher .
+# Update Go modules to latest compatible versions for security patches
+RUN go get -u ./... && \
+    go mod tidy
+
+RUN --mount=type=cache,target=/go/cache \
+    --mount=type=cache,target=/go/pkg \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} go build -ldflags="-s -w" -o /usr/local/bin/launcher .
 
 ####################################################################################################
 # Healthcheck build
 ####################################################################################################
 
-FROM --platform=$BUILDPLATFORM golang:1.25.3-alpine3.21@sha256:0c9f3e09a50a6c11714dbc37a6134fd0c474690030ed07d23a61755afd3a812f AS healthcheck
+FROM go-builder AS healthcheck
 
 WORKDIR /src/healthcheck
 
@@ -259,7 +323,13 @@ ARG TARGETOS TARGETARCH TARGETVARIANT
 
 COPY healthcheck/ ./
 
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} go build -o /usr/local/bin/healthcheck .
+# Update Go modules to latest compatible versions for security patches
+RUN go get -u ./... && \
+    go mod tidy
+
+RUN --mount=type=cache,target=/go/cache \
+    --mount=type=cache,target=/go/pkg \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} go build -ldflags="-s -w" -o /usr/local/bin/healthcheck .
 
 ####################################################################################################
 # Final stage - combine everything
